@@ -1,62 +1,77 @@
-#include <iostream>
-#include <vector>
 #include <cuda_runtime.h>
-#include <cublas_v2.h>
-#include <cuda_profiler_api.h>
+#include <mma.h>
+#include <iostream>
 
-// Error checking macro
-#define CUDA_CHECK(err) { if (err != cudaSuccess) { std::cerr << "CUDA Error: " << cudaGetErrorString(err) << " at line " << __LINE__ << std::endl; exit(1); } }
-#define CUBLAS_CHECK(err) { if (err != CUBLAS_STATUS_SUCCESS) { std::cerr << "cuBLAS Error at line " << __LINE__ << std::endl; exit(1); } }
+using namespace nvcuda;
+
+// Mapping the dimensions for a single WMMA operation
+const int WMMA_M = 16;
+const int WMMA_N = 16;
+const int WMMA_K = 16;
+
+__global__ void wmma_ker(half *a, half *b, float *c, int M, int N, int K) {
+    // Determine the row and column of the "tile" this warp is handling
+    int warpM = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int warpN = (blockIdx.y * blockDim.y + threadIdx.y);
+
+    // Create fragments
+    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> b_frag;
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
+
+    // Initialize accumulator with zeros
+    wmma::fill_fragment(c_frag, 0.0f);
+
+    // Load tiles from global memory
+    // In a real optimized kernel, you'd use shared memory here
+    wmma::load_matrix_sync(a_frag, a + (warpM * WMMA_M * K), K);
+    wmma::load_matrix_sync(b_frag, b + (warpN * WMMA_N * K), K);
+
+    // Perform Matrix Multiply-Accumulate
+    wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+
+    // Store the result back to global memory
+    wmma::store_matrix_sync(c + (warpM * WMMA_M * N + warpN * WMMA_N), c_frag, N, wmma::mem_row_major);
+}
 
 int main() {
-    // Matrix dimensions (M x K) * (K x N) = (M x N)
-    const int M = 2048;
-    const int N = 2048;
-    const int K = 2048;
+    const int M = 1024, N = 1024, K = 1024;
 
-    const float alpha = 1.0f;
-    const float beta = 0.0f;
+    half *h_a, *h_b;
+    float *h_c;
+    half *d_a, *d_b;
+    float *d_c;
 
-    // 1. Allocate Host Memory
-    size_t size_A = M * K * sizeof(float);
-    size_t size_B = K * N * sizeof(float);
-    size_t size_C = M * N * sizeof(float);
+    // Allocation
+    h_a = (half*)malloc(M * K * sizeof(half));
+    h_b = (half*)malloc(K * N * sizeof(half));
+    h_c = (float*)malloc(M * N * sizeof(float));
 
-    std::vector<float> h_A(M * K, 1.1f);
-    std::vector<float> h_B(K * N, 2.2f);
-    std::vector<float> h_C(M * N, 0.0f);
+    cudaMalloc(&d_a, M * K * sizeof(half));
+    cudaMalloc(&d_b, K * N * sizeof(half));
+    cudaMalloc(&d_c, M * N * sizeof(float));
 
-    // 2. Allocate Device Memory
-    float *d_A, *d_B, *d_C;
-    CUDA_CHECK(cudaMalloc(&d_A, size_A));
-    CUDA_CHECK(cudaMalloc(&d_B, size_B));
-    CUDA_CHECK(cudaMalloc(&d_C, size_C));
+    // Initialize data (simplistic for profiling)
+    for (int i = 0; i < M * K; i++) h_a[i] = __float2half(1.0f);
+    for (int i = 0; i < K * N; i++) h_b[i] = __float2half(1.0f);
 
-    // 3. Initialize cuBLAS
-    cublasHandle_t handle;
-    CUBLAS_CHECK(cublasCreate(&handle));
+    cudaMemcpy(d_a, h_a, M * K * sizeof(half), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_b, h_b, K * N * sizeof(half), cudaMemcpyHostToDevice);
 
-    // 4. Copy data to Device
-    CUDA_CHECK(cudaMemcpy(d_A, h_A.data(), size_A, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_B, h_B.data(), size_B, cudaMemcpyHostToDevice));
+    // Setup execution configuration
+    // 32 threads per warp; we want each warp to handle one 16x16 tile
+    dim3 gridDim(M / WMMA_M, N / WMMA_N);
+    dim3 blockDim(32, 1); 
 
-    // 5. Warm-up run (to initialize cuBLAS internals)
-    CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, d_B, N, d_A, K, &beta, d_C, N));
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    // 6. Profiled run
-    std::cout << "Starting profiled SGEMM..." << std::endl;
-    cudaProfilerStart(); 
-    CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, d_B, N, d_A, K, &beta, d_C, N));
-    CUDA_CHECK(cudaDeviceSynchronize());
-    cudaProfilerStop();
+    std::cout << "Launching Tensor Core Kernel..." << std::endl;
+    wmma_ker<<<gridDim, blockDim>>>(d_a, d_b, d_c, M, N, K);
+    
+    cudaDeviceSynchronize();
     std::cout << "Done." << std::endl;
 
-    // 7. Cleanup
-    CUDA_CHECK(cudaFree(d_A));
-    CUDA_CHECK(cudaFree(d_B));
-    CUDA_CHECK(cudaFree(d_C));
-    CUBLAS_CHECK(cublasDestroy(handle));
+    // Cleanup
+    cudaFree(d_a); cudaFree(d_b); cudaFree(d_c);
+    free(h_a); free(h_b); free(h_c);
 
     return 0;
 }
