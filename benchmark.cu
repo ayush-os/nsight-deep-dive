@@ -3,107 +3,97 @@
 
 #define BLOCK_SIZE 256
 
-// --- KERNEL 1: Shared Memory with BANK CONFLICTS ---
-__global__ void reduceBankConflicts(float* g_idata, float* g_odata, unsigned int n) {
-    __shared__ uint8_t sdata_raw[BLOCK_SIZE * sizeof(float)]; // Raw bytes for alignment
-    float* sdata = reinterpret_cast<float*>(sdata_raw);
-
-    unsigned int tid = threadIdx.x;
+// --- KERNEL 1: Unoptimized Global Memory Scan (Kogge-Stone) ---
+// This is "unoptimized" because it hits Global Memory in a loop 
+// and creates non-coalesced access patterns as 'stride' increases.
+__global__ void scanGlobalNaive(float* g_idata, float* g_odata, int n) {
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
-    
-    sdata[tid] = (i < n) ? g_idata[i] : 0;
-    __syncthreads();
+    if (i >= n) return;
 
-    // Strategy: 2-way interleaved addressing (Causes 2-way, 4-way, etc. bank conflicts)
-    for (unsigned int s = 1; s < blockDim.x; s *= 2) {
-        int index = 2 * s * tid;
-        if (index < blockDim.x) {
-            sdata[index] += sdata[index + s];
+    for (unsigned int stride = 1; stride < n; stride *= 2) {
+        float val = 0;
+        if (i >= stride) {
+            val = g_idata[i - stride];
+        }
+        __syncthreads(); // Note: This only works within a single block!
+        if (i >= stride) {
+            g_idata[i] += val;
         }
         __syncthreads();
     }
-
-    if (tid == 0) g_odata[blockIdx.x] = sdata[0];
+    g_odata[i] = g_idata[i];
 }
 
-// --- KERNEL 2: Shared Memory (Optimized, No Bank Conflicts) ---
-__global__ void reduceOptimizedShared(float* g_idata, float* g_odata, unsigned int n) {
-    __shared__ float sdata[BLOCK_SIZE];
+// --- KERNEL 2: Optimized Shared Memory Scan (Blelloch) ---
+// Uses Coalesced Global Loads/Stores and avoids bank conflicts 
+// by using sequential addressing in shared memory.
+__global__ void scanOptimized(float* g_idata, float* g_odata, int n) {
+    __shared__ float temp[BLOCK_SIZE * 2]; // Twice the block size for Blelloch
+    int tid = threadIdx.x;
+    int offset = 1;
 
-    unsigned int tid = threadIdx.x;
-    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
-    
-    sdata[tid] = (i < n) ? g_idata[i] : 0;
-    __syncthreads();
+    // Coalesced load from global memory to shared memory
+    int ai = tid;
+    int bi = tid + (n / 2);
+    temp[ai] = g_idata[ai];
+    temp[bi] = g_idata[bi];
 
-    // Strategy: Sequential addressing (No bank conflicts)
-    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            sdata[tid] += sdata[tid + s];
-        }
+    // Up-Sweep (Reduction Phase)
+    for (int d = n >> 1; d > 0; d >>= 1) {
         __syncthreads();
+        if (tid < d) {
+            int i = offset * (2 * tid + 1) - 1;
+            int j = offset * (2 * tid + 2) - 1;
+            temp[j] += temp[i];
+        }
+        offset *= 2;
     }
 
-    if (tid == 0) g_odata[blockIdx.x] = sdata[0];
-}
+    // Clear the last element for exclusive scan
+    if (tid == 0) { temp[n - 1] = 0; }
 
-// --- KERNEL 3: Warp Shuffle (Bypassing Shared Memory) ---
-__global__ void reduceWarpShuffle(float* g_idata, float* g_odata, unsigned int n) {
-    float val = 0;
-    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) val = g_idata[i];
-
-    // Intra-warp reduction using shuffle
-    for (int offset = warpSize / 2; offset > 0; offset /= 2) {
-        val += __shfl_down_sync(0xFFFFFFFF, val, offset);
-    }
-
-    // Shared memory only used once per block to collect warp results
-    __shared__ float warpSums[32]; 
-    int lane = threadIdx.x % warpSize;
-    int wid = threadIdx.x / warpSize;
-
-    if (lane == 0) warpSums[wid] = val;
-    __syncthreads();
-
-    // Final reduction of warp sums in the first warp
-    val = (threadIdx.x < blockDim.x / warpSize) ? warpSums[lane] : 0;
-    if (wid == 0) {
-        for (int offset = (blockDim.x / warpSize) / 2; offset > 0; offset /= 2) {
-            val += __shfl_down_sync(0xFFFFFFFF, val, offset);
+    // Down-Sweep Phase
+    for (int d = 1; d < n; d *= 2) {
+        offset >>= 1;
+        __syncthreads();
+        if (tid < d) {
+            int i = offset * (2 * tid + 1) - 1;
+            int j = offset * (2 * tid + 2) - 1;
+            float t = temp[i];
+            temp[i] = temp[j];
+            temp[j] += t;
         }
     }
+    __syncthreads();
 
-    if (threadIdx.x == 0) g_odata[blockIdx.x] = val;
+    // Coalesced store back to global memory
+    g_odata[ai] = temp[ai];
+    g_odata[bi] = temp[bi];
 }
 
 int main() {
-    const int N = 1 << 20; // 1M elements
+    const int N = BLOCK_SIZE; // Simplified for single-block profiling
     size_t size = N * sizeof(float);
 
-    float *h_in = new float[N];
+    float h_in[N];
     for (int i = 0; i < N; i++) h_in[i] = 1.0f;
 
     float *d_in, *d_out;
     cudaMalloc(&d_in, size);
     cudaMalloc(&d_out, size);
+
+    // Launch Naive
     cudaMemcpy(d_in, h_in, size, cudaMemcpyHostToDevice);
-
-    dim3 threads(BLOCK_SIZE);
-    dim3 blocks((N + BLOCK_SIZE - 1) / BLOCK_SIZE);
-
-    // --- Launch Kernels ---
-    std::cout << "Launching kernels for profiling..." << std::endl;
+    scanGlobalNaive<<<1, N>>>(d_in, d_out, N);
     
-    reduceBankConflicts<<<blocks, threads>>>(d_in, d_out, N);
-    reduceOptimizedShared<<<blocks, threads>>>(d_in, d_out, N);
-    reduceWarpShuffle<<<blocks, threads>>>(d_in, d_out, N);
+    // Launch Optimized
+    cudaMemcpy(d_in, h_in, size, cudaMemcpyHostToDevice);
+    scanOptimized<<<1, N / 2>>>(d_in, d_out, N);
 
     cudaDeviceSynchronize();
-    std::cout << "Done." << std::endl;
+    std::cout << "Scan profiling kernels complete." << std::endl;
 
     cudaFree(d_in);
     cudaFree(d_out);
-    delete[] h_in;
     return 0;
 }
