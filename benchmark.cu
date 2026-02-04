@@ -1,101 +1,62 @@
 #include <iostream>
+#include <vector>
 #include <cuda_runtime.h>
+#include <cublas_v2.h>
+#include <cuda_profiler_api.h>
 
-#define TILE_SIZE 32
-
-// CUDA Kernel: Tiled Matrix Multiplication
-__global__ void matmul_tiled_kernel(float* A, float* B, float* C, int N) {
-    // Shared memory for tiles of A and B
-    __shared__ float as[TILE_SIZE][TILE_SIZE];
-    __shared__ float bs[TILE_SIZE][TILE_SIZE];
-
-    int bx = blockIdx.x; int by = blockIdx.y;
-    int tx = threadIdx.x; int ty = threadIdx.y;
-
-    // Identify the row and column of the C element to work on
-    int row = by * TILE_SIZE + ty;
-    int col = bx * TILE_SIZE + tx;
-
-    float sum = 0.0f;
-
-    // Loop over tiles required to compute the C element
-    for (int t = 0; t < (N + TILE_SIZE - 1) / TILE_SIZE; ++t) {
-        
-        // Coalesced loading from Global Memory to Shared Memory
-        if (row < N && (t * TILE_SIZE + tx) < N)
-            as[ty][tx] = A[row * N + (t * TILE_SIZE + tx)];
-        else
-            as[ty][tx] = 0.0f;
-
-        if (col < N && (t * TILE_SIZE + ty) < N)
-            bs[ty][tx] = B[(t * TILE_SIZE + ty) * N + col];
-        else
-            bs[ty][tx] = 0.0f;
-
-        // Synchronize to ensure the entire tile is loaded
-        __syncthreads();
-
-        // Compute partial product from the tile
-        for (int k = 0; k < TILE_SIZE; ++k) {
-            sum += as[ty][k] * bs[k][tx];
-        }
-
-        // Synchronize before loading the next tile
-        __syncthreads();
-    }
-
-    // Write the final result back to Global Memory
-    if (row < N && col < N) {
-        C[row * N + col] = sum;
-    }
-}
-
-void check_cuda_error(cudaError_t err, const char* msg) {
-    if (err != cudaSuccess) {
-        std::cerr << "CUDA Error: " << msg << " - " << cudaGetErrorString(err) << std::endl;
-        exit(EXIT_FAILURE);
-    }
-}
+// Error checking macro
+#define CUDA_CHECK(err) { if (err != cudaSuccess) { std::cerr << "CUDA Error: " << cudaGetErrorString(err) << " at line " << __LINE__ << std::endl; exit(1); } }
+#define CUBLAS_CHECK(err) { if (err != CUBLAS_STATUS_SUCCESS) { std::cerr << "cuBLAS Error at line " << __LINE__ << std::endl; exit(1); } }
 
 int main() {
-    // Matrix size (N x N) - Use a multiple of TILE_SIZE for clean profiling
-    const int N = 1024;
-    size_t size = N * N * sizeof(float);
+    // Matrix dimensions (M x K) * (K x N) = (M x N)
+    const int M = 2048;
+    const int N = 2048;
+    const int K = 2048;
 
-    // Host allocation
-    float *h_A = (float*)malloc(size);
-    float *h_B = (float*)malloc(size);
-    float *h_C = (float*)malloc(size);
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
 
-    for (int i = 0; i < N * N; i++) {
-        h_A[i] = 1.0f;
-        h_B[i] = 2.0f;
-    }
+    // 1. Allocate Host Memory
+    size_t size_A = M * K * sizeof(float);
+    size_t size_B = K * N * sizeof(float);
+    size_t size_C = M * N * sizeof(float);
 
-    // Device allocation
+    std::vector<float> h_A(M * K, 1.1f);
+    std::vector<float> h_B(K * N, 2.2f);
+    std::vector<float> h_C(M * N, 0.0f);
+
+    // 2. Allocate Device Memory
     float *d_A, *d_B, *d_C;
-    check_cuda_error(cudaMalloc(&d_A, size), "Malloc A");
-    check_cuda_error(cudaMalloc(&d_B, size), "Malloc B");
-    check_cuda_error(cudaMalloc(&d_C, size), "Malloc C");
+    CUDA_CHECK(cudaMalloc(&d_A, size_A));
+    CUDA_CHECK(cudaMalloc(&d_B, size_B));
+    CUDA_CHECK(cudaMalloc(&d_C, size_C));
 
-    check_cuda_error(cudaMemcpy(d_A, h_A, size, cudaMemcpyHostToDevice), "Copy A");
-    check_cuda_error(cudaMemcpy(d_B, h_B, size, cudaMemcpyHostToDevice), "Copy B");
+    // 3. Initialize cuBLAS
+    cublasHandle_t handle;
+    CUBLAS_CHECK(cublasCreate(&handle));
 
-    // Launch configuration
-    dim3 threadsPerBlock(TILE_SIZE, TILE_SIZE);
-    dim3 blocksPerGrid((N + TILE_SIZE - 1) / TILE_SIZE, (N + TILE_SIZE - 1) / TILE_SIZE);
+    // 4. Copy data to Device
+    CUDA_CHECK(cudaMemcpy(d_A, h_A.data(), size_A, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_B, h_B.data(), size_B, cudaMemcpyHostToDevice));
 
-    std::cout << "Launching Kernel: Matrix Size " << N << "x" << N << std::endl;
-    
-    // Warmup and launch
-    matmul_tiled_kernel<<<blocksPerGrid, threadsPerBlock>>>(d_A, d_B, d_C, N);
-    check_cuda_error(cudaDeviceSynchronize(), "Kernel Exec");
+    // 5. Warm-up run (to initialize cuBLAS internals)
+    CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, d_B, N, d_A, K, &beta, d_C, N));
+    CUDA_CHECK(cudaDeviceSynchronize());
 
+    // 6. Profiled run
+    std::cout << "Starting profiled SGEMM..." << std::endl;
+    cudaProfilerStart(); 
+    CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, d_B, N, d_A, K, &beta, d_C, N));
+    CUDA_CHECK(cudaDeviceSynchronize());
+    cudaProfilerStop();
     std::cout << "Done." << std::endl;
 
-    // Cleanup
-    cudaFree(d_A); cudaFree(d_B); cudaFree(d_C);
-    free(h_A); free(h_B); free(h_C);
+    // 7. Cleanup
+    CUDA_CHECK(cudaFree(d_A));
+    CUDA_CHECK(cudaFree(d_B));
+    CUDA_CHECK(cudaFree(d_C));
+    CUBLAS_CHECK(cublasDestroy(handle));
 
     return 0;
 }
