@@ -1,128 +1,98 @@
 #include <iostream>
-#include <vector>
 #include <cuda_runtime.h>
 
-#define WARP_SIZE 32
+#define TILE_SIZE 16
+#define KERNEL_RADIUS 2
+#define KERNEL_WIDTH (2 * KERNEL_RADIUS + 1)
 
-// --- KERNEL 1: Scalar (Naive) ---
-// Each thread processes one row. Poor coalescing.
-__global__ void spmv_scalar(const int* row_ptr, const int* col_idx, const float* values, 
-                            const float* x, float* y, int num_rows) {
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row < num_rows) {
-        float sum = 0;
-        int row_start = row_ptr[row];
-        int row_end = row_ptr[row + 1];
-        for (int i = row_start; i < row_end; i++) {
-            sum += values[i] * x[col_idx[i]];
+// --- KERNEL 1: Naive 2D Conv (High Branch Divergence) ---
+__global__ void conv2d_naive(float* input, float* output, float* kernel, int width, int height) {
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (row < height && col < width) {
+        float sum = 0.0f;
+        for (int i = -KERNEL_RADIUS; i <= KERNEL_RADIUS; i++) {
+            for (int j = -KERNEL_RADIUS; j <= KERNEL_RADIUS; j++) {
+                int curRow = row + i;
+                int curCol = col + j;
+
+                // BRANCH DIVERGENCE: Edge threads take the 'if', inner threads don't.
+                // In a warp, if one thread hits the boundary, the whole warp executes both paths.
+                if (curRow >= 0 && curRow < height && curCol >= 0 && curCol < width) {
+                    sum += input[curRow * width + curCol] * kernel[(i + KERNEL_RADIUS) * KERNEL_WIDTH + (j + KERNEL_RADIUS)];
+                }
+            }
         }
-        y[row] = sum;
+        output[row * width + col] = sum;
     }
 }
 
-// --- KERNEL 2: Vector (Shared Memory) ---
-// One warp processes one row. Coalesced reads, but uses Shared Mem.
-__global__ void spmv_vector_smem(const int* row_ptr, const int* col_idx, const float* values, 
-                                 const float* x, float* y, int num_rows) {
-    __shared__ float sdata[128]; // Enough for 4 warps per block (128 threads)
-    
-    int thread_id = blockIdx.x * blockDim.x + threadIdx.x;
-    int warp_id = thread_id / WARP_SIZE;
-    int lane = thread_id % WARP_SIZE;
-    int row = warp_id;
+// --- KERNEL 2: Tiled Shared Memory (Optimized) ---
+__global__ void conv2d_tiled(float* input, float* output, float* kernel, int width, int height) {
+    // Shared memory needs to be larger than the tile to account for the "halo"
+    __shared__ float s_data[TILE_SIZE + 2 * KERNEL_RADIUS][TILE_SIZE + 2 * KERNEL_RADIUS];
 
-    if (row < num_rows) {
-        int row_start = row_ptr[row];
-        int row_end = row_ptr[row + 1];
-        float sum = 0;
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int col = blockIdx.x * TILE_SIZE + tx;
+    int row = blockIdx.y * TILE_SIZE + ty;
 
-        for (int i = row_start + lane; i < row_end; i += WARP_SIZE) {
-            sum += values[i] * x[col_idx[i]];
+    // Load main tile + halo into shared memory
+    for (int i = ty; i < TILE_SIZE + 2 * KERNEL_RADIUS; i += TILE_SIZE) {
+        for (int j = tx; j < TILE_SIZE + 2 * KERNEL_RADIUS; j += TILE_SIZE) {
+            int curRow = blockIdx.y * TILE_SIZE + i - KERNEL_RADIUS;
+            int curCol = blockIdx.x * TILE_SIZE + j - KERNEL_RADIUS;
+
+            if (curRow >= 0 && curRow < height && curCol >= 0 && curCol < width)
+                s_data[i][j] = input[curRow * width + curCol];
+            else
+                s_data[i][j] = 0.0f;
         }
-
-        sdata[threadIdx.x] = sum;
-        __syncwarp();
-
-        // Manual reduction in shared memory (prone to bank conflicts if not careful)
-        for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-            if (lane < offset) sdata[threadIdx.x] += sdata[threadIdx.x + offset];
-            __syncwarp();
-        }
-
-        if (lane == 0) y[row] = sdata[threadIdx.x];
     }
-}
+    __syncthreads();
 
-// --- KERNEL 3: Warp Shuffle (Optimized) ---
-// One warp per row, bypassing shared memory for reduction.
-__global__ void spmv_warp_shuffle(const int* row_ptr, const int* col_idx, const float* values, 
-                                  const float* x, float* y, int num_rows) {
-    int thread_id = blockIdx.x * blockDim.x + threadIdx.x;
-    int warp_id = thread_id / WARP_SIZE;
-    int lane = thread_id % WARP_SIZE;
-    int row = warp_id;
-
-    if (row < num_rows) {
-        int row_start = row_ptr[row];
-        int row_end = row_ptr[row + 1];
-        float sum = 0;
-
-        for (int i = row_start + lane; i < row_end; i += WARP_SIZE) {
-            sum += values[i] * x[col_idx[i]];
+    if (row < height && col < width) {
+        float sum = 0.0f;
+        for (int i = 0; i < KERNEL_WIDTH; i++) {
+            for (int j = 0; j < KERNEL_WIDTH; j++) {
+                sum += s_data[ty + i][tx + j] * kernel[i * KERNEL_WIDTH + j];
+            }
         }
-
-        // Warp Shuffle Reduction
-        for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-            sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
-        }
-
-        if (lane == 0) y[row] = sum;
+        output[row * width + col] = sum;
     }
 }
 
 int main() {
-    const int num_rows = 10000;
-    const int nnz_per_row = 32;
-    const int nnz = num_rows * nnz_per_row;
+    const int W = 2048;
+    const int H = 2048;
+    size_t img_size = W * H * sizeof(float);
+    size_t kernel_size = KERNEL_WIDTH * KERNEL_WIDTH * sizeof(float);
 
-    // Host Data
-    std::vector<int> h_row_ptr(num_rows + 1);
-    std::vector<int> h_col_idx(nnz);
-    std::vector<float> h_values(nnz);
-    std::vector<float> h_x(num_rows, 1.0f);
+    float *h_in = new float[W * H];
+    float *h_kern = new float[KERNEL_WIDTH * KERNEL_WIDTH];
+    for (int i = 0; i < W * H; i++) h_in[i] = 1.0f;
+    for (int i = 0; i < KERNEL_WIDTH * KERNEL_WIDTH; i++) h_kern[i] = 0.1f;
 
-    for (int i = 0; i < num_rows; i++) {
-        h_row_ptr[i] = i * nnz_per_row;
-        for (int j = 0; j < nnz_per_row; j++) {
-            h_col_idx[i * nnz_per_row + j] = (i + j) % num_rows;
-            h_values[i * nnz_per_row + j] = 1.0f;
-        }
-    }
-    h_row_ptr[num_rows] = nnz;
+    float *d_in, *d_out, *d_kern;
+    cudaMalloc(&d_in, img_size);
+    cudaMalloc(&d_out, img_size);
+    cudaMalloc(&d_kern, kernel_size);
 
-    // Device Data
-    int *d_row_ptr, *d_col_idx;
-    float *d_values, *d_x, *d_y;
-    cudaMalloc(&d_row_ptr, (num_rows + 1) * sizeof(int));
-    cudaMalloc(&d_col_idx, nnz * sizeof(int));
-    cudaMalloc(&d_values, nnz * sizeof(float));
-    cudaMalloc(&d_x, num_rows * sizeof(float));
-    cudaMalloc(&d_y, num_rows * sizeof(float));
+    cudaMemcpy(d_in, h_in, img_size, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_kern, h_kern, kernel_size, cudaMemcpyHostToDevice);
 
-    cudaMemcpy(d_row_ptr, h_row_ptr.data(), (num_rows + 1) * sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_col_idx, h_col_idx.data(), nnz * sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_values, h_values.data(), nnz * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_x, h_x.data(), num_rows * sizeof(float), cudaMemcpyHostToDevice);
+    dim3 threads(TILE_SIZE, TILE_SIZE);
+    dim3 blocks((W + TILE_SIZE - 1) / TILE_SIZE, (H + TILE_SIZE - 1) / TILE_SIZE);
 
-    // Launch
-    dim3 block(128);
-    dim3 grid_scalar((num_rows + 127) / 128);
-    dim3 grid_vector((num_rows * WARP_SIZE + 127) / 128);
-
-    spmv_scalar<<<grid_scalar, block>>>(d_row_ptr, d_col_idx, d_values, d_x, d_y, num_rows);
-    spmv_vector_smem<<<grid_vector, block>>>(d_row_ptr, d_col_idx, d_values, d_x, d_y, num_rows);
-    spmv_warp_shuffle<<<grid_vector, block>>>(d_row_ptr, d_col_idx, d_values, d_x, d_y, num_rows);
+    std::cout << "Profiling 2D Convolution..." << std::endl;
+    conv2d_naive<<<blocks, threads>>>(d_in, d_out, d_kern, W, H);
+    conv2d_tiled<<<blocks, threads>>>(d_in, d_out, d_kern, W, H);
 
     cudaDeviceSynchronize();
+    std::cout << "Done." << std::endl;
+
+    cudaFree(d_in); cudaFree(d_out); cudaFree(d_kern);
+    delete[] h_in; delete[] h_kern;
     return 0;
 }
