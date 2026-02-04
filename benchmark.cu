@@ -74,7 +74,7 @@ __global__ void reduceWarpShuffle(float* g_idata, float* g_odata, unsigned int n
         }
     }
 
-    if (tid == 0) g_odata[blockIdx.x] = val;
+    if (threadIdx.x == 0) g_odata[blockIdx.x] = val;
 }
 
 int main() {
