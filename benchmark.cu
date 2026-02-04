@@ -1,77 +1,109 @@
-#include <cuda_runtime.h>
-#include <mma.h>
 #include <iostream>
+#include <cuda_runtime.h>
 
-using namespace nvcuda;
+#define BLOCK_SIZE 256
 
-// Mapping the dimensions for a single WMMA operation
-const int WMMA_M = 16;
-const int WMMA_N = 16;
-const int WMMA_K = 16;
+// --- KERNEL 1: Shared Memory with BANK CONFLICTS ---
+__global__ void reduceBankConflicts(float* g_idata, float* g_odata, unsigned int n) {
+    __shared__ uint8_t sdata_raw[BLOCK_SIZE * sizeof(float)]; // Raw bytes for alignment
+    float* sdata = reinterpret_cast<float*>(sdata_raw);
 
-__global__ void wmma_ker(half *a, half *b, float *c, int M, int N, int K) {
-    // Determine the row and column of the "tile" this warp is handling
-    int warpM = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
-    int warpN = (blockIdx.y * blockDim.y + threadIdx.y);
+    unsigned int tid = threadIdx.x;
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    sdata[tid] = (i < n) ? g_idata[i] : 0;
+    __syncthreads();
 
-    // Create fragments
-    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag;
-    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> b_frag;
-    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
+    // Strategy: 2-way interleaved addressing (Causes 2-way, 4-way, etc. bank conflicts)
+    for (unsigned int s = 1; s < blockDim.x; s *= 2) {
+        int index = 2 * s * tid;
+        if (index < blockDim.x) {
+            sdata[index] += sdata[index + s];
+        }
+        __syncthreads();
+    }
 
-    // Initialize accumulator with zeros
-    wmma::fill_fragment(c_frag, 0.0f);
+    if (tid == 0) g_odata[blockIdx.x] = sdata[0];
+}
 
-    // Load tiles from global memory
-    // In a real optimized kernel, you'd use shared memory here
-    wmma::load_matrix_sync(a_frag, a + (warpM * WMMA_M * K), K);
-    wmma::load_matrix_sync(b_frag, b + (warpN * WMMA_N * K), K);
+// --- KERNEL 2: Shared Memory (Optimized, No Bank Conflicts) ---
+__global__ void reduceOptimizedShared(float* g_idata, float* g_odata, unsigned int n) {
+    __shared__ float sdata[BLOCK_SIZE];
 
-    // Perform Matrix Multiply-Accumulate
-    wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+    unsigned int tid = threadIdx.x;
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    sdata[tid] = (i < n) ? g_idata[i] : 0;
+    __syncthreads();
 
-    // Store the result back to global memory
-    wmma::store_matrix_sync(c + (warpM * WMMA_M * N + warpN * WMMA_N), c_frag, N, wmma::mem_row_major);
+    // Strategy: Sequential addressing (No bank conflicts)
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) g_odata[blockIdx.x] = sdata[0];
+}
+
+// --- KERNEL 3: Warp Shuffle (Bypassing Shared Memory) ---
+__global__ void reduceWarpShuffle(float* g_idata, float* g_odata, unsigned int n) {
+    float val = 0;
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) val = g_idata[i];
+
+    // Intra-warp reduction using shuffle
+    for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+        val += __shfl_down_sync(0xFFFFFFFF, val, offset);
+    }
+
+    // Shared memory only used once per block to collect warp results
+    __shared__ float warpSums[32]; 
+    int lane = threadIdx.x % warpSize;
+    int wid = threadIdx.x / warpSize;
+
+    if (lane == 0) warpSums[wid] = val;
+    __syncthreads();
+
+    // Final reduction of warp sums in the first warp
+    val = (threadIdx.x < blockDim.x / warpSize) ? warpSums[lane] : 0;
+    if (wid == 0) {
+        for (int offset = (blockDim.x / warpSize) / 2; offset > 0; offset /= 2) {
+            val += __shfl_down_sync(0xFFFFFFFF, val, offset);
+        }
+    }
+
+    if (tid == 0) g_odata[blockIdx.x] = val;
 }
 
 int main() {
-    const int M = 1024, N = 1024, K = 1024;
+    const int N = 1 << 20; // 1M elements
+    size_t size = N * sizeof(float);
 
-    half *h_a, *h_b;
-    float *h_c;
-    half *d_a, *d_b;
-    float *d_c;
+    float *h_in = new float[N];
+    for (int i = 0; i < N; i++) h_in[i] = 1.0f;
 
-    // Allocation
-    h_a = (half*)malloc(M * K * sizeof(half));
-    h_b = (half*)malloc(K * N * sizeof(half));
-    h_c = (float*)malloc(M * N * sizeof(float));
+    float *d_in, *d_out;
+    cudaMalloc(&d_in, size);
+    cudaMalloc(&d_out, size);
+    cudaMemcpy(d_in, h_in, size, cudaMemcpyHostToDevice);
 
-    cudaMalloc(&d_a, M * K * sizeof(half));
-    cudaMalloc(&d_b, K * N * sizeof(half));
-    cudaMalloc(&d_c, M * N * sizeof(float));
+    dim3 threads(BLOCK_SIZE);
+    dim3 blocks((N + BLOCK_SIZE - 1) / BLOCK_SIZE);
 
-    // Initialize data (simplistic for profiling)
-    for (int i = 0; i < M * K; i++) h_a[i] = __float2half(1.0f);
-    for (int i = 0; i < K * N; i++) h_b[i] = __float2half(1.0f);
-
-    cudaMemcpy(d_a, h_a, M * K * sizeof(half), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_b, h_b, K * N * sizeof(half), cudaMemcpyHostToDevice);
-
-    // Setup execution configuration
-    // 32 threads per warp; we want each warp to handle one 16x16 tile
-    dim3 gridDim(M / WMMA_M, N / WMMA_N);
-    dim3 blockDim(32, 1); 
-
-    std::cout << "Launching Tensor Core Kernel..." << std::endl;
-    wmma_ker<<<gridDim, blockDim>>>(d_a, d_b, d_c, M, N, K);
+    // --- Launch Kernels ---
+    std::cout << "Launching kernels for profiling..." << std::endl;
     
+    reduceBankConflicts<<<blocks, threads>>>(d_in, d_out, N);
+    reduceOptimizedShared<<<blocks, threads>>>(d_in, d_out, N);
+    reduceWarpShuffle<<<blocks, threads>>>(d_in, d_out, N);
+
     cudaDeviceSynchronize();
     std::cout << "Done." << std::endl;
 
-    // Cleanup
-    cudaFree(d_a); cudaFree(d_b); cudaFree(d_c);
-    free(h_a); free(h_b); free(h_c);
-
+    cudaFree(d_in);
+    cudaFree(d_out);
+    delete[] h_in;
     return 0;
 }
